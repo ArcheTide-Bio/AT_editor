@@ -36,13 +36,29 @@ _INSTANCE_JS = """
     var iid        = '__IID__';
     var initSmiles = '__SMILES__';
     var commTarget = 'jsme___IID__';
+    var sentinel   = '__JSME___IID____';   /* unique value on the hidden widget */
 
-    /* Update the hidden input and visible label. */
+    /* Update the hidden input, the visible label, and the ipywidgets Text
+       widget (found by its sentinel defaultValue so ipywidgets can sync the
+       value to Python without needing google.colab). */
     function onSmilesChange(smiles) {
         var inp  = document.getElementById('jsme_smiles_' + iid);
         var disp = document.getElementById('jsme_display_' + iid);
-        if (inp)  inp.value     = smiles;
+        if (inp)  inp.value        = smiles;
         if (disp) disp.textContent = smiles;
+
+        /* Find the hidden ipywidgets Text input by its sentinel defaultValue. */
+        try {
+            var inputs = document.querySelectorAll('input[type="text"]');
+            for (var i = 0; i < inputs.length; i++) {
+                if (inputs[i].defaultValue === sentinel) {
+                    inputs[i].value = smiles;
+                    inputs[i].dispatchEvent(new Event('input',  {bubbles: true}));
+                    inputs[i].dispatchEvent(new Event('change', {bubbles: true}));
+                    break;
+                }
+            }
+        } catch(e) {}
     }
 
     function initEditor() {
@@ -128,9 +144,27 @@ class JSMEEditor:
         if mol is not None:
             smiles = _mol_to_smiles(mol)
         self._initial_smiles = smiles or ""
-        self._smiles = self._initial_smiles   # kept current by _handle_comm
+        self._smiles = self._initial_smiles
 
-        # Register a comm target so the JS side can push SMILES to Python.
+        # Hidden ipywidgets.Text — JS fires a synthetic 'input' event on it
+        # so ipywidgets' own comm syncs the value to Python without needing
+        # google.colab.  The sentinel value lets JS identify the right element.
+        self._sentinel = f'__JSME_{self._id}__'
+        try:
+            import ipywidgets as _w
+            self._widget = _w.Text(
+                value=self._sentinel,
+                layout=_w.Layout(display='none'),
+            )
+            self._widget.observe(
+                lambda c: setattr(self, '_smiles', c['new'])
+                if not c['new'].startswith('__JSME_') else None,
+                names=['value'],
+            )
+        except Exception:
+            self._widget = None
+
+        # Also register an ipykernel comm target (classic Jupyter).
         try:
             ip = get_ipython()
             if ip and getattr(ip, 'kernel', None) is not None:
@@ -155,6 +189,8 @@ class JSMEEditor:
 
     def show(self):
         """Render the editor."""
+        if self._widget is not None:
+            display(self._widget)   # registers widget comm with the frontend
         display(HTML(self._build_html()))
 
     def _repr_html_(self) -> str:
@@ -199,6 +235,11 @@ class JSMEEditor:
             return result or ""
         except ImportError:
             pass
+        # Widget value is updated by JS via synthetic DOM input event.
+        if self._widget is not None:
+            v = self._widget.value
+            if v and not v.startswith('__JSME_'):
+                return v
         return self._smiles
 
     def set_smiles(self, smiles: str):
