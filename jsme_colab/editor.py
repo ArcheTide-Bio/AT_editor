@@ -42,27 +42,34 @@ _INSTANCE_JS = """
         var inp = document.getElementById('jsme_smiles_' + iid);
         if (inp) inp.value = smiles;
 
-        // ── Classic Jupyter: proper ipywidgets comm protocol ──────────────
-        try {
-            var comm = IPython.notebook.kernel.comm_manager.comms[modelId];
-            if (comm) {
-                comm.send({method: 'update', state: {value: smiles}, buffer_paths: []});
-                return;
-            }
-        } catch(e) {}
+        // ── Classic Jupyter Notebook ──────────────────────────────────────
+        // widget_manager.get_model() is the correct API; comm_manager.comms
+        // only holds JS-opened comms and never contains Python-opened widget comms.
+        var notebook = (window.Jupyter && Jupyter.notebook)
+                    || (window.IPython && IPython.notebook);
+        if (notebook && notebook.widget_manager) {
+            notebook.widget_manager.get_model(modelId).then(function(m) {
+                m.set('value', smiles);
+                m.save_changes();
+            }).catch(function() {});
+            return;
+        }
 
         // ── JupyterLab / VS Code: requirejs ──────────────────────────────
-        try {
-            require(['@jupyter-widgets/base'], function(base) {
-                var mgr = base.ManagerBase._managers && base.ManagerBase._managers[0];
-                if (mgr) {
-                    mgr.get_model(modelId).then(function(m) {
-                        m.set('value', smiles);
-                        m.save_changes();
-                    });
-                }
-            });
-        } catch(e) {}
+        if (typeof require === 'function') {
+            try {
+                require(['@jupyter-widgets/base'], function(base) {
+                    var managers = base.ManagerBase && base.ManagerBase._managers;
+                    var mgr = managers && managers[0];
+                    if (mgr) {
+                        mgr.get_model(modelId).then(function(m) {
+                            m.set('value', smiles);
+                            m.save_changes();
+                        }).catch(function() {});
+                    }
+                });
+            } catch(e) {}
+        }
     }
 
     function initEditor() {
@@ -144,15 +151,10 @@ class JSMEEditor:
 
     def show(self):
         """Render the editor (call when auto-display is not triggered)."""
-        import ipywidgets as widgets
-        display(widgets.VBox([self._widget]))  # display hidden widget first
+        display(self._widget)  # registers widget model with widget_manager
         display(HTML(_LOAD_JS + self._build_instance_html()))
 
     def _build_html(self) -> str:
-        import ipywidgets as widgets
-        # _repr_html_ can't display widget objects, so we only return the
-        # JSME HTML; IPython will call _repr_html_ and also display the widget
-        # via the widget protocol automatically when using display().
         return _LOAD_JS + self._build_instance_html()
 
     def _build_instance_html(self) -> str:
