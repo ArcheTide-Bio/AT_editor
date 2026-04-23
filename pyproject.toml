@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jsme-colab"
+version = "0.1.0"
+description = "Embed the JSME molecule editor in Google Colab / Jupyter notebooks"
+requires-python = ">=3.8"
+dependencies = ["ipython", "ipywidgets>=7"]
+
+[project.optional-dependencies]
+rdkit = ["rdkit"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jsme_colab*"]
