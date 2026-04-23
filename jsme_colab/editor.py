@@ -2,7 +2,8 @@ import uuid
 from IPython import get_ipython
 from IPython.display import display, HTML
 
-JSME_JS_URL = "https://unpkg.com/jsme-editor/jsme.nocache.js"
+JSME_JS_URL  = "https://unpkg.com/jsme-editor@2024.4.29/jsme.nocache.js"
+JSME_BASE_URL = "https://unpkg.com/jsme-editor@2024.4.29"
 
 # Module-level registry so kernel.execute() code can reach editor instances.
 _registry: dict = {}
@@ -15,37 +16,63 @@ def _set(editor_id: str, smiles: str) -> None:
         ed._smiles = smiles
 
 
-# Per-instance HTML — __IID__, __SMILES__, __WIDTH__, __HEIGHT__, __OPTIONS__
-# are replaced in _build_instance_html().
-# The <script src> tag loads JSME directly (works in Colab's CSP where
-# document.head.appendChild is blocked).  jsmeOnLoad is set up before the
-# tag so GWT finds it on first load; subsequent loads see JSApplet already
-# defined and skip the queue entirely.
+# Per-instance HTML.  Uses fetch+eval instead of <script src> so that
+# Colab's script-src CSP restriction is bypassed (fetch goes through
+# connect-src which is typically less restrictive).
+# GWT's own internal <script> injection is also intercepted.
 _INSTANCE_JS = """
-<script type="text/javascript">
-if (!window._jsme_instances) {
-    window._jsme_instances = {};
-    window._jsme_queue     = [];
-    window.jsmeOnLoad = function() {
-        window._jsme_ready = true;
-        window._jsme_queue.forEach(function(fn) { fn(); });
-        window._jsme_queue = [];
-    };
-}
-</script>
-<script type="text/javascript" language="javascript"
-        src="__JSME_URL__"></script>
 <input type="hidden" id="jsme_smiles___IID__" value="__SMILES__">
 <div   id="jsme_status___IID__"
-       style="font:12px sans-serif;color:#888;padding:4px">Loading JSME editor…</div>
+       style="font:12px sans-serif;color:#888;padding:4px">Loading JSME…</div>
 <div   id="jsme_container___IID__"></div>
 <div   id="jsme_display___IID__"
        style="font:12px/1.4 monospace;color:#555;margin-top:4px;min-height:1em">__SMILES__</div>
-<script type="text/javascript">
+<script>
 (function() {
     var iid        = '__IID__';
     var initSmiles = '__SMILES__';
+    var JSME_BASE  = '__JSME_BASE__';
 
+    /* ── One-time page setup ────────────────────────────────────────────── */
+    if (!window._jsme_instances) {
+        window._jsme_instances = {};
+        window._jsme_queue     = [];
+        window._jsme_loading   = false;
+
+        window.jsmeOnLoad = function() {
+            window._jsme_ready = true;
+            window._jsme_queue.forEach(function(fn) { fn(); });
+            window._jsme_queue = [];
+        };
+
+        /* Intercept head/body appendChild so GWT's internal <script src>
+           calls are redirected to fetch+eval (bypasses script-src CSP). */
+        var _wrap = function(proto) {
+            var orig = proto.appendChild;
+            proto.appendChild = function(el) {
+                if (el && el.tagName === 'SCRIPT' && el.src) {
+                    var src = el.src;
+                    el.removeAttribute('src');          /* stop native load */
+                    orig.call(this, el);                /* add to DOM first */
+                    fetch(src)
+                        .then(function(r) { return r.text(); })
+                        .then(function(code) {
+                            try { (0, eval)(code); } catch(e) {}
+                            el.dispatchEvent(new Event('load'));
+                        })
+                        .catch(function() {
+                            el.dispatchEvent(new Event('error'));
+                        });
+                    return el;
+                }
+                return orig.call(this, el);
+            };
+        };
+        _wrap(HTMLHeadElement.prototype);
+        _wrap(HTMLBodyElement.prototype);
+    }
+
+    /* ── Per-instance helpers ───────────────────────────────────────────── */
     function onSmilesChange(smiles) {
         var inp  = document.getElementById('jsme_smiles_' + iid);
         var disp = document.getElementById('jsme_display_' + iid);
@@ -53,21 +80,16 @@ if (!window._jsme_instances) {
         if (disp) disp.textContent = smiles;
 
         if (window.google !== undefined) {
-            // Colab (hosted runtime)
             google.colab.kernel.invokeFunction('jsme_cb___IID__', [smiles], {});
             return;
         }
-        // Classic Jupyter Notebook / JupyterLab
         var nb = (window.Jupyter  && Jupyter.notebook)
               || (window.IPython  && IPython.notebook);
         if (nb && nb.kernel) {
             var safe = smiles.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-            nb.kernel.execute(
-                'import jsme_colab as _j; _j._set("' + iid + '",\'' + safe + '\')'
-            );
+            nb.kernel.execute('import jsme_colab as _j; _j._set("' + iid + '",\'' + safe + '\')');
             return;
         }
-        // JupyterLab via window.jupyterapp
         try {
             var panel  = window.jupyterapp && window.jupyterapp.shell.currentWidget;
             var kernel = panel && panel.sessionContext
@@ -83,14 +105,10 @@ if (!window._jsme_instances) {
         var status = document.getElementById('jsme_status_' + iid);
         if (status) status.style.display = 'none';
         var applet = new JSApplet.JSME(
-            'jsme_container_' + iid,
-            '__WIDTH__', '__HEIGHT__',
-            {options: '__OPTIONS__'}
+            'jsme_container_' + iid, '__WIDTH__', '__HEIGHT__', {options: '__OPTIONS__'}
         );
         if (initSmiles) applet.readGenericMolecularInput(initSmiles);
         window._jsme_instances[iid] = applet;
-
-        // JupyterLab: open one comm per editor for reuse
         try {
             var panel  = window.jupyterapp && window.jupyterapp.shell.currentWidget;
             var kernel = panel && panel.sessionContext
@@ -98,40 +116,46 @@ if (!window._jsme_instances) {
                       && panel.sessionContext.session.kernel;
             if (kernel) {
                 window._jsme_lab_comm = window._jsme_lab_comm || {};
-                var comm = kernel.createComm('jsme___IID__');
-                comm.open({});
-                window._jsme_lab_comm[iid] = comm;
+                var c = kernel.createComm('jsme___IID__');
+                c.open({});
+                window._jsme_lab_comm[iid] = c;
             }
         } catch(e) {}
-
         applet.setCallBack('AfterStructureModified', function() {
             onSmilesChange(applet.smiles());
         });
     }
 
-    // If JSApplet is already available (JSME cached), init immediately.
+    /* ── Bootstrap JSME via fetch+eval ─────────────────────────────────── */
+    function loadJSME() {
+        window._jsme_loading = true;
+        fetch(JSME_BASE + '/jsme.nocache.js')
+            .then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.text();
+            })
+            .then(function(code) { (0, eval)(code); })
+            .catch(function(e) {
+                var s = document.getElementById('jsme_status_' + iid);
+                if (s) {
+                    s.style.color = '#c00';
+                    s.textContent = 'JSME load error: ' + e;
+                    s.style.display = '';
+                }
+            });
+    }
+
     if (typeof JSApplet !== 'undefined' && JSApplet.JSME) {
         initEditor();
     } else if (window._jsme_ready) {
         initEditor();
     } else {
-        window._jsme_queue = window._jsme_queue || [];
         window._jsme_queue.push(initEditor);
-        // Show error if JSME hasn't loaded after 10 s (CSP / network block).
-        setTimeout(function() {
-            if (!window._jsme_instances || !window._jsme_instances[iid]) {
-                var s = document.getElementById('jsme_status_' + iid);
-                if (s) {
-                    s.style.color = '#c00';
-                    s.textContent = 'JSME failed to load. CDN may be blocked. URL: __JSME_URL__';
-                    s.style.display = '';
-                }
-            }
-        }, 10000);
+        if (!window._jsme_loading) loadJSME();
     }
 })();
 </script>
-""".replace("__JSME_URL__", JSME_JS_URL)
+"""
 
 
 def _mol_to_smiles(mol) -> str:
@@ -219,11 +243,12 @@ class JSMEEditor:
         )
         html = (
             _INSTANCE_JS
-            .replace("__IID__",     self._id)
-            .replace("__SMILES__",  safe)
-            .replace("__WIDTH__",   self._width)
-            .replace("__HEIGHT__",  self._height)
-            .replace("__OPTIONS__", self._options)
+            .replace("__JSME_BASE__", JSME_BASE_URL)
+            .replace("__IID__",       self._id)
+            .replace("__SMILES__",    safe)
+            .replace("__WIDTH__",     self._width)
+            .replace("__HEIGHT__",    self._height)
+            .replace("__OPTIONS__",   self._options)
         )
         return html
 
