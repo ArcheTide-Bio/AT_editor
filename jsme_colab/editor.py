@@ -1,9 +1,9 @@
 import uuid
+from IPython import get_ipython
 from IPython.display import display, HTML
 
 JSME_JS_URL = "https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"
 
-# JS snippet injected once per notebook to load JSME and manage instances.
 _LOAD_JS = """
 <script>
 (function() {
@@ -25,51 +25,24 @@ _LOAD_JS = """
 </script>
 """.replace("__JSME_URL__", JSME_JS_URL)
 
-# Per-instance init + SMILES-sync JS.
-# __IID__, __SMILES__, __WIDTH__, __HEIGHT__, __OPTIONS__, __MODEL_ID__
-# are replaced before injection.
+# __IID__, __SMILES__, __WIDTH__, __HEIGHT__, __OPTIONS__ are replaced before use.
 _INSTANCE_JS = """
-<input type="hidden" id="jsme_smiles___IID__" value="__SMILES__">
-<div id="jsme_container___IID__"></div>
+<input  type="hidden" id="jsme_smiles___IID__" value="__SMILES__">
+<div    id="jsme_container___IID__"></div>
+<div    id="jsme_display___IID__"
+        style="font:12px/1.4 monospace;color:#555;margin-top:4px;min-height:1em">__SMILES__</div>
 <script>
 (function() {
-    var iid       = '__IID__';
-    var modelId   = '__MODEL_ID__';
+    var iid        = '__IID__';
     var initSmiles = '__SMILES__';
+    var commTarget = 'jsme___IID__';
 
-    function syncToWidget(smiles) {
-        // Always update the hidden input — eval_js reads this in Colab.
-        var inp = document.getElementById('jsme_smiles_' + iid);
-        if (inp) inp.value = smiles;
-
-        // ── Classic Jupyter Notebook ──────────────────────────────────────
-        // widget_manager.get_model() is the correct API; comm_manager.comms
-        // only holds JS-opened comms and never contains Python-opened widget comms.
-        var notebook = (window.Jupyter && Jupyter.notebook)
-                    || (window.IPython && IPython.notebook);
-        if (notebook && notebook.widget_manager) {
-            notebook.widget_manager.get_model(modelId).then(function(m) {
-                m.set('value', smiles);
-                m.save_changes();
-            }).catch(function() {});
-            return;
-        }
-
-        // ── JupyterLab / VS Code: requirejs ──────────────────────────────
-        if (typeof require === 'function') {
-            try {
-                require(['@jupyter-widgets/base'], function(base) {
-                    var managers = base.ManagerBase && base.ManagerBase._managers;
-                    var mgr = managers && managers[0];
-                    if (mgr) {
-                        mgr.get_model(modelId).then(function(m) {
-                            m.set('value', smiles);
-                            m.save_changes();
-                        }).catch(function() {});
-                    }
-                });
-            } catch(e) {}
-        }
+    /* Update the hidden input and visible label. */
+    function onSmilesChange(smiles) {
+        var inp  = document.getElementById('jsme_smiles_' + iid);
+        var disp = document.getElementById('jsme_display_' + iid);
+        if (inp)  inp.value     = smiles;
+        if (disp) disp.textContent = smiles;
     }
 
     function initEditor() {
@@ -81,8 +54,23 @@ _INSTANCE_JS = """
         if (initSmiles) applet.readGenericMolecularInput(initSmiles);
         window._jsme_instances[iid] = applet;
 
-        applet.setCallBack('AfterStructureModified', function(ev) {
-            syncToWidget(ev.src.smiles());
+        /* Open a Jupyter comm so Python receives every SMILES change.
+           Works in classic Jupyter Notebook; silently skipped elsewhere. */
+        var comm = null;
+        try {
+            var nb = (window.Jupyter  && Jupyter.notebook)
+                  || (window.IPython  && IPython.notebook);
+            if (nb && nb.kernel && nb.kernel.comm_manager) {
+                comm = nb.kernel.comm_manager.new_comm(commTarget, {});
+            }
+        } catch(e) {}
+
+        applet.setCallBack('AfterStructureModified', function() {
+            var smiles = applet.smiles();
+            onSmilesChange(smiles);
+            if (comm) {
+                try { comm.send({smiles: smiles}); } catch(e) {}
+            }
         });
     }
 
@@ -111,67 +99,71 @@ class JSMEEditor:
         SMILES string to pre-populate the editor.
     mol : rdkit.Chem.Mol, optional
         RDKit molecule to pre-populate (converted to SMILES).
-    width, height : str
-        Editor dimensions (CSS length strings, e.g. ``"380px"``).
+    width, height : str or int
+        Editor dimensions — integers are treated as pixels.
     options : str
         Comma-separated JSME option flags (e.g. ``"query,hydrogens"``).
     """
 
     def __init__(self, smiles: str = "", mol=None,
-                 width="380px", height="340px",
-                 options: str = ""):
-        try:
-            import ipywidgets as widgets
-        except ImportError as e:
-            raise ImportError(
-                "jsme_colab requires ipywidgets: pip install ipywidgets"
-            ) from e
-
+                 width="380px", height="340px", options: str = ""):
         self._id = uuid.uuid4().hex[:8]
-        self._width = f"{width}px" if isinstance(width, int) else width
-        self._height = f"{height}px" if isinstance(height, int) else height
+        self._width   = f"{width}px"  if isinstance(width,  int) else width
+        self._height  = f"{height}px" if isinstance(height, int) else height
         self._options = options
 
         if mol is not None:
             smiles = _mol_to_smiles(mol)
         self._initial_smiles = smiles or ""
+        self._smiles = self._initial_smiles   # kept current by _handle_comm
 
-        # Hidden Text widget — JS writes here, Python reads here.
-        self._widget = widgets.Text(
-            value=self._initial_smiles,
-            layout=widgets.Layout(display="none"),
-        )
+        # Register a comm target so the JS side can push SMILES to Python.
+        try:
+            ip = get_ipython()
+            if ip and getattr(ip, 'kernel', None) is not None:
+                ip.kernel.comm_manager.register_target(
+                    f'jsme_{self._id}', self._handle_comm
+                )
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Comm handler (Jupyter only)
+    # ------------------------------------------------------------------
+
+    def _handle_comm(self, comm, open_msg):
+        @comm.on_msg
+        def _(msg):
+            self._smiles = msg['content']['data'].get('smiles', self._smiles)
 
     # ------------------------------------------------------------------
     # Display
     # ------------------------------------------------------------------
 
+    def show(self):
+        """Render the editor."""
+        display(HTML(self._build_html()))
+
     def _repr_html_(self) -> str:
         return self._build_html()
-
-    def show(self):
-        """Render the editor (call when auto-display is not triggered)."""
-        display(self._widget)  # registers widget model with widget_manager
-        display(HTML(_LOAD_JS + self._build_instance_html()))
 
     def _build_html(self) -> str:
         return _LOAD_JS + self._build_instance_html()
 
     def _build_instance_html(self) -> str:
-        safe_smiles = (
+        safe = (
             self._initial_smiles
             .replace("\\", "\\\\")
-            .replace("'", "\\'")
-            .replace('"', '\\"')
+            .replace("'",  "\\'")
+            .replace('"',  '\\"')
         )
         return (
             _INSTANCE_JS
-            .replace("__IID__",      self._id)
-            .replace("__MODEL_ID__", self._widget.model_id)
-            .replace("__SMILES__",   safe_smiles)
-            .replace("__WIDTH__",    self._width)
-            .replace("__HEIGHT__",   self._height)
-            .replace("__OPTIONS__",  self._options)
+            .replace("__IID__",     self._id)
+            .replace("__SMILES__",  safe)
+            .replace("__WIDTH__",   self._width)
+            .replace("__HEIGHT__",  self._height)
+            .replace("__OPTIONS__", self._options)
         )
 
     # ------------------------------------------------------------------
@@ -179,61 +171,43 @@ class JSMEEditor:
     # ------------------------------------------------------------------
 
     def get_smiles(self) -> str:
-        """Return the current SMILES from the editor.
+        """Return the current SMILES.
 
-        * **Colab** — uses ``eval_js`` for a synchronous, up-to-the-moment read.
-        * **Jupyter Notebook / Lab / VS Code** — reads the widget value that
-          JavaScript keeps up to date via the ``AfterStructureModified``
-          callback.  Call this from a *separate cell* after editing so the
-          kernel has had time to process the async update.
+        * **Colab** — synchronous read via ``eval_js``.
+        * **Jupyter Notebook** — returns the value last pushed by the
+          ``AfterStructureModified`` callback.  Run this from a *separate
+          cell* so the kernel has processed the JS message.
         """
-        # Colab: read the hidden input that JS keeps current on every edit.
         try:
             from google.colab.output import eval_js
             result = eval_js(
-                f"(document.getElementById('jsme_smiles_{self._id}') || {{}}).value || ''"
+                f"(document.getElementById('jsme_smiles_{self._id}')||{{}}).value||''"
             )
             return result or ""
         except ImportError:
             pass
-
-        # Jupyter: widget value is pushed by JS via the ipywidgets comm.
-        return self._widget.value
+        return self._smiles
 
     def set_smiles(self, smiles: str):
-        """Update the molecule shown in an already-displayed editor.
-
-        Works in Colab (via ``eval_js``) and classic Jupyter Notebook
-        (via ``kernel.execute``).  In JupyterLab / VS Code, call
-        :meth:`show` again with the new SMILES instead.
-        """
+        """Update the molecule in an already-displayed editor."""
         safe = smiles.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+        js = (
+            f"(function(){{"
+            f"var a=window._jsme_instances&&window._jsme_instances['{self._id}'];"
+            f"if(a)a.readGenericMolecularInput('{safe}');"
+            f"}})()"
+        )
         try:
             from google.colab.output import eval_js
-            eval_js(
-                f"(function(){{"
-                f"  var a=window._jsme_instances['{self._id}'];"
-                f"  if(a) a.readGenericMolecularInput('{safe}');"
-                f"}})()"
-            )
+            eval_js(js)
             return
-        except (ImportError, Exception):
+        except ImportError:
             pass
-
-        # Classic Jupyter: run JS via display
         from IPython.display import Javascript
-        display(Javascript(
-            f"(function(){{"
-            f"  var a=window._jsme_instances['{self._id}'];"
-            f"  if(a) a.readGenericMolecularInput('{safe}');"
-            f"}})()"
-        ))
+        display(Javascript(js))
 
     def get_mol(self):
-        """Return an RDKit ``Mol`` for the current editor content.
-
-        Returns ``None`` if the canvas is empty.
-        """
+        """Return an RDKit ``Mol`` for the current editor content, or ``None``."""
         from rdkit import Chem
         smiles = self.get_smiles()
         if not smiles:
@@ -245,19 +219,19 @@ class JSMEEditor:
 
 
 # ------------------------------------------------------------------
-# Convenience function
+# Convenience
 # ------------------------------------------------------------------
 
 def embed(smiles: str = "", mol=None, **kwargs) -> "JSMEEditor":
     """Create and immediately display a :class:`JSMEEditor`.
 
-    Returns the editor instance so you can later call
-    :meth:`~JSMEEditor.get_smiles` or :meth:`~JSMEEditor.get_mol`.
+    Returns the editor so you can later call :meth:`~JSMEEditor.get_smiles`
+    or :meth:`~JSMEEditor.get_mol`.
 
     Example::
 
         editor = embed("CC(=O)Oc1ccccc1C(=O)O")
-        # ... edit in the notebook ...
+        # draw / edit the molecule …
         smiles = editor.get_smiles()
     """
     editor = JSMEEditor(smiles=smiles, mol=mol, **kwargs)

@@ -7,7 +7,7 @@ name = "jsme-colab"
 version = "0.1.0"
 description = "Embed the JSME molecule editor in Google Colab / Jupyter notebooks"
 requires-python = ">=3.8"
-dependencies = ["ipython", "ipywidgets>=7"]
+dependencies = ["ipython"]
 
 [project.optional-dependencies]
 rdkit = ["rdkit"]
