@@ -46,12 +46,19 @@ _INSTANCE_JS = """
         if (inp)  inp.value        = smiles;
         if (disp) disp.textContent = smiles;
 
-        /* Write to the parent (Colab page) frame so eval_js can read it.
-           eval_js runs in the parent context, not the cell-output iframe. */
+        /* Write to every reachable frame so eval_js can find it wherever
+           it runs (current iframe, parent page, or grandparent). */
         try {
-            var p = window.parent || window;
-            p._jsme_smiles_store = p._jsme_smiles_store || {};
-            p._jsme_smiles_store[iid] = smiles;
+            window._jsme_smiles_store = window._jsme_smiles_store || {};
+            window._jsme_smiles_store[iid] = smiles;
+        } catch(e) {}
+        try {
+            window.parent._jsme_smiles_store = window.parent._jsme_smiles_store || {};
+            window.parent._jsme_smiles_store[iid] = smiles;
+        } catch(e) {}
+        try {
+            window.top._jsme_smiles_store = window.top._jsme_smiles_store || {};
+            window.top._jsme_smiles_store[iid] = smiles;
         } catch(e) {}
     }
 
@@ -203,16 +210,32 @@ class JSMEEditor:
         """
         try:
             from google.colab.output import eval_js
-            # eval_js runs in the Colab parent-page context.
-            # The polling writes the SMILES there via window.parent._jsme_smiles_store.
             result = eval_js(
-                f"(window._jsme_smiles_store && window._jsme_smiles_store['{self._id}']) || ''"
+                f"(function(){{"
+                f"  var id='{self._id}';"
+                f"  return (window._jsme_smiles_store        && window._jsme_smiles_store[id])"
+                f"      || (window.parent._jsme_smiles_store && window.parent._jsme_smiles_store[id])"
+                f"      || (window.top._jsme_smiles_store    && window.top._jsme_smiles_store[id])"
+                f"      || '';"
+                f"}})()"
             )
             if result:
                 return result
-        except ImportError:
+        except Exception:
             pass
         return self._smiles
+
+    def debug_smiles(self) -> dict:
+        """Return a dict showing what each path sees — use to diagnose."""
+        out = {'id': self._id, 'self._smiles': self._smiles}
+        try:
+            from google.colab.output import eval_js
+            out['eval_js_window']  = eval_js(f"(window._jsme_smiles_store||{{}})['{self._id}']")
+            out['eval_js_parent']  = eval_js(f"(window.parent._jsme_smiles_store||{{}})['{self._id}']")
+            out['eval_js_top']     = eval_js(f"(window.top._jsme_smiles_store||{{}})['{self._id}']")
+        except Exception as e:
+            out['eval_js_error'] = str(e)
+        return out
 
     def set_smiles(self, smiles: str):
         """Update the molecule in an already-displayed editor."""
