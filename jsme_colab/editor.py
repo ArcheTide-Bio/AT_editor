@@ -46,19 +46,10 @@ _INSTANCE_JS = """
         if (inp)  inp.value        = smiles;
         if (disp) disp.textContent = smiles;
 
-        /* Write to every reachable frame so eval_js can find it wherever
-           it runs (current iframe, parent page, or grandparent). */
+        /* Store in current frame (for eval_js in hosted Colab). */
         try {
             window._jsme_smiles_store = window._jsme_smiles_store || {};
             window._jsme_smiles_store[iid] = smiles;
-        } catch(e) {}
-        try {
-            window.parent._jsme_smiles_store = window.parent._jsme_smiles_store || {};
-            window.parent._jsme_smiles_store[iid] = smiles;
-        } catch(e) {}
-        try {
-            window.top._jsme_smiles_store = window.top._jsme_smiles_store || {};
-            window.top._jsme_smiles_store[iid] = smiles;
         } catch(e) {}
     }
 
@@ -208,16 +199,12 @@ class JSMEEditor:
           ``AfterStructureModified`` callback.  Run this from a *separate
           cell* so the kernel has processed the JS message.
         """
+        # self._smiles is kept current by the Jupyter comm (polling → comm.send).
+        # eval_js is a faster path for hosted Colab where the store is reachable.
         try:
             from google.colab.output import eval_js
             result = eval_js(
-                f"(function(){{"
-                f"  var id='{self._id}';"
-                f"  return (window._jsme_smiles_store        && window._jsme_smiles_store[id])"
-                f"      || (window.parent._jsme_smiles_store && window.parent._jsme_smiles_store[id])"
-                f"      || (window.top._jsme_smiles_store    && window.top._jsme_smiles_store[id])"
-                f"      || '';"
-                f"}})()"
+                f"(window._jsme_smiles_store && window._jsme_smiles_store['{self._id}']) || ''"
             )
             if result:
                 return result
