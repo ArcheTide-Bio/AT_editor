@@ -2,8 +2,7 @@ import uuid
 from IPython import get_ipython
 from IPython.display import display, HTML
 
-JSME_JS_URL  = "https://unpkg.com/jsme-editor@2024.4.29/jsme.nocache.js"
-JSME_BASE_URL = "https://unpkg.com/jsme-editor@2024.4.29"
+JSME_JS_URL = "https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"
 
 # Module-level registry so kernel.execute() code can reach editor instances.
 _registry: dict = {}
@@ -16,14 +15,30 @@ def _set(editor_id: str, smiles: str) -> None:
         ed._smiles = smiles
 
 
-# Per-instance HTML.  Uses fetch+eval instead of <script src> so that
-# Colab's script-src CSP restriction is bypassed (fetch goes through
-# connect-src which is typically less restrictive).
-# GWT's own internal <script> injection is also intercepted.
+_LOAD_JS = """
+<script>
+(function() {
+    if (window._jsme_colab_loaded) return;
+    window._jsme_colab_loaded = true;
+    window._jsme_instances = {};
+    window._jsme_queue = [];
+
+    window.jsmeOnLoad = function() {
+        window._jsme_ready = true;
+        window._jsme_queue.forEach(function(fn) { fn(); });
+        window._jsme_queue = [];
+    };
+
+    var s = document.createElement('script');
+    s.src = '__JSME_URL__';
+    document.head.appendChild(s);
+})();
+</script>
+""".replace("__JSME_URL__", JSME_JS_URL)
+
+# __IID__, __SMILES__, __WIDTH__, __HEIGHT__, __OPTIONS__ replaced before use.
 _INSTANCE_JS = """
 <input type="hidden" id="jsme_smiles___IID__" value="__SMILES__">
-<div   id="jsme_status___IID__"
-       style="font:12px sans-serif;color:#888;padding:4px">Loading JSME…</div>
 <div   id="jsme_container___IID__"></div>
 <div   id="jsme_display___IID__"
        style="font:12px/1.4 monospace;color:#555;margin-top:4px;min-height:1em">__SMILES__</div>
@@ -31,127 +46,75 @@ _INSTANCE_JS = """
 (function() {
     var iid        = '__IID__';
     var initSmiles = '__SMILES__';
-    var JSME_BASE  = '__JSME_BASE__';
 
-    /* ── One-time page setup ────────────────────────────────────────────── */
-    if (!window._jsme_instances) {
-        window._jsme_instances = {};
-        window._jsme_queue     = [];
-        window._jsme_loading   = false;
-
-        window.jsmeOnLoad = function() {
-            window._jsme_ready = true;
-            window._jsme_queue.forEach(function(fn) { fn(); });
-            window._jsme_queue = [];
-        };
-
-        /* Intercept head/body appendChild so GWT's internal <script src>
-           calls are redirected to fetch+eval (bypasses script-src CSP). */
-        var _wrap = function(proto) {
-            var orig = proto.appendChild;
-            proto.appendChild = function(el) {
-                if (el && el.tagName === 'SCRIPT' && el.src) {
-                    var src = el.src;
-                    el.removeAttribute('src');          /* stop native load */
-                    orig.call(this, el);                /* add to DOM first */
-                    fetch(src)
-                        .then(function(r) { return r.text(); })
-                        .then(function(code) {
-                            try { (0, eval)(code); } catch(e) {}
-                            el.dispatchEvent(new Event('load'));
-                        })
-                        .catch(function() {
-                            el.dispatchEvent(new Event('error'));
-                        });
-                    return el;
-                }
-                return orig.call(this, el);
-            };
-        };
-        _wrap(HTMLHeadElement.prototype);
-        _wrap(HTMLBodyElement.prototype);
-    }
-
-    /* ── Per-instance helpers ───────────────────────────────────────────── */
-    function onSmilesChange(smiles) {
+    function onSmilesChange(smiles, labComm) {
+        // Always update the hidden input and visible label.
         var inp  = document.getElementById('jsme_smiles_' + iid);
         var disp = document.getElementById('jsme_display_' + iid);
         if (inp)  inp.value        = smiles;
         if (disp) disp.textContent = smiles;
 
+        // ── Colab ─────────────────────────────────────────────────────────────
         if (window.google !== undefined) {
             google.colab.kernel.invokeFunction('jsme_cb___IID__', [smiles], {});
             return;
         }
+
+        // ── Classic Jupyter Notebook ───────────────────────────────────────────
+        // window.Jupyter is set by classic Jupyter Notebook; not by JupyterLab.
         var nb = (window.Jupyter  && Jupyter.notebook)
               || (window.IPython  && IPython.notebook);
         if (nb && nb.kernel) {
             var safe = smiles.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-            nb.kernel.execute('import jsme_colab as _j; _j._set("' + iid + '",\'' + safe + '\')');
+            nb.kernel.execute(
+                'import jsme_colab as _j; _j._set("' + iid + '", \'' + safe + '\')'
+            );
             return;
         }
-        try {
-            var panel  = window.jupyterapp && window.jupyterapp.shell.currentWidget;
-            var kernel = panel && panel.sessionContext
-                      && panel.sessionContext.session
-                      && panel.sessionContext.session.kernel;
-            if (kernel && window._jsme_lab_comm && window._jsme_lab_comm[iid]) {
-                window._jsme_lab_comm[iid].send({smiles: smiles});
-            }
-        } catch(e) {}
+
+        // ── JupyterLab ────────────────────────────────────────────────────────
+        // window.jupyterapp is the JupyterLab application instance (v3+).
+        // We opened a kernel comm in initEditor(); just send on it here.
+        if (labComm) {
+            try { labComm.send({smiles: smiles}); } catch(e) {}
+        }
     }
 
     function initEditor() {
-        var status = document.getElementById('jsme_status_' + iid);
-        if (status) status.style.display = 'none';
         var applet = new JSApplet.JSME(
-            'jsme_container_' + iid, '__WIDTH__', '__HEIGHT__', {options: '__OPTIONS__'}
+            'jsme_container_' + iid,
+            '__WIDTH__', '__HEIGHT__',
+            {options: '__OPTIONS__'}
         );
         if (initSmiles) applet.readGenericMolecularInput(initSmiles);
         window._jsme_instances[iid] = applet;
-        try {
-            var panel  = window.jupyterapp && window.jupyterapp.shell.currentWidget;
-            var kernel = panel && panel.sessionContext
-                      && panel.sessionContext.session
-                      && panel.sessionContext.session.kernel;
-            if (kernel) {
-                window._jsme_lab_comm = window._jsme_lab_comm || {};
-                var c = kernel.createComm('jsme___IID__');
-                c.open({});
-                window._jsme_lab_comm[iid] = c;
-            }
-        } catch(e) {}
+
+        // JupyterLab: open a kernel comm once so we can reuse it on every edit.
+        var labComm = null;
+        if (!window.google && !window.Jupyter && !(window.IPython && IPython.notebook)) {
+            try {
+                var panel  = window.jupyterapp && window.jupyterapp.shell.currentWidget;
+                var kernel = panel
+                          && panel.sessionContext
+                          && panel.sessionContext.session
+                          && panel.sessionContext.session.kernel;
+                if (kernel) {
+                    labComm = kernel.createComm('jsme___IID__');
+                    labComm.open({});
+                }
+            } catch(e) {}
+        }
+
         applet.setCallBack('AfterStructureModified', function() {
-            onSmilesChange(applet.smiles());
+            onSmilesChange(applet.smiles(), labComm);
         });
     }
 
-    /* ── Bootstrap JSME via fetch+eval ─────────────────────────────────── */
-    function loadJSME() {
-        window._jsme_loading = true;
-        fetch(JSME_BASE + '/jsme.nocache.js')
-            .then(function(r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.text();
-            })
-            .then(function(code) { (0, eval)(code); })
-            .catch(function(e) {
-                var s = document.getElementById('jsme_status_' + iid);
-                if (s) {
-                    s.style.color = '#c00';
-                    s.textContent = 'JSME load error: ' + e;
-                    s.style.display = '';
-                }
-            });
-    }
-
-    if (typeof JSApplet !== 'undefined' && JSApplet.JSME) {
-        initEditor();
-    } else if (window._jsme_ready) {
+    if (window._jsme_ready) {
         initEditor();
     } else {
+        window._jsme_queue = window._jsme_queue || [];
         window._jsme_queue.push(initEditor);
-        if (!window._jsme_loading) loadJSME();
     }
 })();
 </script>
@@ -232,7 +195,7 @@ class JSMEEditor:
         return self._build_html()
 
     def _build_html(self) -> str:
-        return self._build_instance_html()
+        return _LOAD_JS + self._build_instance_html()
 
     def _build_instance_html(self) -> str:
         safe = (
@@ -243,12 +206,11 @@ class JSMEEditor:
         )
         html = (
             _INSTANCE_JS
-            .replace("__JSME_BASE__", JSME_BASE_URL)
-            .replace("__IID__",       self._id)
-            .replace("__SMILES__",    safe)
-            .replace("__WIDTH__",     self._width)
-            .replace("__HEIGHT__",    self._height)
-            .replace("__OPTIONS__",   self._options)
+            .replace("__IID__",     self._id)
+            .replace("__SMILES__",  safe)
+            .replace("__WIDTH__",   self._width)
+            .replace("__HEIGHT__",  self._height)
+            .replace("__OPTIONS__", self._options)
         )
         return html
 
@@ -259,20 +221,11 @@ class JSMEEditor:
     def get_smiles(self) -> str:
         """Return the current SMILES.
 
-        * **Colab** — reads the hidden ``<input>`` that the JS callback keeps
-          current on every edit, via ``eval_js`` (synchronous).
-        * **Jupyter Notebook** — returns ``self._smiles`` updated by
-          ``kernel.execute()`` on every edit; call from a *separate cell*.
+        * **Colab** — reads from ``self._smiles``, which is kept current by
+          ``google.colab.kernel.invokeFunction`` on every edit.
+        * **Jupyter Notebook** — same; ``kernel.execute()`` updates it on
+          every edit.  Call this from a *separate cell* after editing.
         """
-        try:
-            from google.colab.output import eval_js
-            result = eval_js(
-                f"(document.getElementById('jsme_smiles_{self._id}')||{{}}).value"
-            )
-            if result is not None:
-                return result
-        except ImportError:
-            pass
         return self._smiles
 
     def set_smiles(self, smiles: str):
