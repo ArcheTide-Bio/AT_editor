@@ -2,7 +2,7 @@ import uuid
 from IPython import get_ipython
 from IPython.display import display, HTML
 
-JSME_JS_URL = "https://jsme-editor.github.io/dist/jsme/jsme.nocache.js"
+JSME_JS_URL = "https://unpkg.com/jsme-editor/jsme.nocache.js"
 
 # Module-level registry so kernel.execute() code can reach editor instances.
 _registry: dict = {}
@@ -36,6 +36,8 @@ if (!window._jsme_instances) {
 <script type="text/javascript" language="javascript"
         src="__JSME_URL__"></script>
 <input type="hidden" id="jsme_smiles___IID__" value="__SMILES__">
+<div   id="jsme_status___IID__"
+       style="font:12px sans-serif;color:#888;padding:4px">Loading JSME editor…</div>
 <div   id="jsme_container___IID__"></div>
 <div   id="jsme_display___IID__"
        style="font:12px/1.4 monospace;color:#555;margin-top:4px;min-height:1em">__SMILES__</div>
@@ -78,6 +80,8 @@ if (!window._jsme_instances) {
     }
 
     function initEditor() {
+        var status = document.getElementById('jsme_status_' + iid);
+        if (status) status.style.display = 'none';
         var applet = new JSApplet.JSME(
             'jsme_container_' + iid,
             '__WIDTH__', '__HEIGHT__',
@@ -113,6 +117,17 @@ if (!window._jsme_instances) {
     } else {
         window._jsme_queue = window._jsme_queue || [];
         window._jsme_queue.push(initEditor);
+        // Show error if JSME hasn't loaded after 10 s (CSP / network block).
+        setTimeout(function() {
+            if (!window._jsme_instances || !window._jsme_instances[iid]) {
+                var s = document.getElementById('jsme_status_' + iid);
+                if (s) {
+                    s.style.color = '#c00';
+                    s.textContent = 'JSME failed to load. CDN may be blocked. URL: __JSME_URL__';
+                    s.style.display = '';
+                }
+            }
+        }, 10000);
     }
 })();
 </script>
