@@ -65,13 +65,26 @@ _INSTANCE_JS = """
             }
         } catch(e) {}
 
-        applet.setCallBack('AfterStructureModified', function() {
+        function handleChange() {
             var smiles = applet.smiles();
             onSmilesChange(smiles);
             if (comm) {
                 try { comm.send({smiles: smiles}); } catch(e) {}
             }
-        });
+        }
+
+        /* Primary: JSME callback (instant). */
+        applet.setCallBack('AfterStructureModified', handleChange);
+
+        /* Fallback: poll every 300 ms in case setCallBack does not fire
+           (observed in some Colab environments). */
+        var _lastSmiles = initSmiles;
+        setInterval(function() {
+            try {
+                var s = applet.smiles();
+                if (s !== _lastSmiles) { _lastSmiles = s; handleChange(); }
+            } catch(e) {}
+        }, 300);
     }
 
     if (window._jsme_ready) {
