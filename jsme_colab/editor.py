@@ -54,6 +54,17 @@ _INSTANCE_JS = """
         if (inp)  inp.value        = smiles;
         if (disp) disp.textContent = smiles;
 
+        // Write SMILES to a global store so eval_js can read it from any
+        // context (current frame, parent frame, or shared Colab window).
+        window._jsme_smiles_store = window._jsme_smiles_store || {};
+        window._jsme_smiles_store[iid] = smiles;
+        try {
+            if (window.parent && window.parent !== window) {
+                window.parent._jsme_smiles_store = window.parent._jsme_smiles_store || {};
+                window.parent._jsme_smiles_store[iid] = smiles;
+            }
+        } catch(e) {}
+
         // ── Colab ─────────────────────────────────────────────────────────────
         if (window.google !== undefined) {
             google.colab.kernel.invokeFunction('jsme_cb___IID__', [smiles], {});
@@ -221,11 +232,33 @@ class JSMEEditor:
     def get_smiles(self) -> str:
         """Return the current SMILES.
 
-        * **Colab** — reads from ``self._smiles``, which is kept current by
-          ``google.colab.kernel.invokeFunction`` on every edit.
-        * **Jupyter Notebook** — same; ``kernel.execute()`` updates it on
-          every edit.  Call this from a *separate cell* after editing.
+        * **Colab** — uses ``eval_js`` to synchronously read the live applet
+          state; falls back to ``self._smiles`` (kept current by
+          ``invokeFunction``) if ``eval_js`` runs in a different frame.
+        * **Jupyter Notebook / Lab** — returns ``self._smiles`` which is
+          updated on every edit.  Call this from a *separate cell*.
         """
+        try:
+            from google.colab.output import eval_js
+            # Try, in order:
+            #   1. Read directly from the live applet (same JS context).
+            #   2. Read from the smiles store in the current window.
+            #   3. Read from the parent window (if eval_js runs in an iframe).
+            result = eval_js(
+                "(function(){"
+                f"var id='{self._id}',"
+                "a=window._jsme_instances&&window._jsme_instances[id],"
+                "s=window._jsme_smiles_store&&window._jsme_smiles_store[id],"
+                "p=window.parent&&window.parent._jsme_smiles_store;"
+                "return a?a.smiles():(s!==undefined?s:(p&&p[id]!==undefined?p[id]:null));"
+                "})()"
+            )
+            if result is not None:
+                return result
+        except ImportError:
+            pass
+        except Exception:
+            pass
         return self._smiles
 
     def set_smiles(self, smiles: str):
