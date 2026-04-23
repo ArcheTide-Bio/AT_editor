@@ -47,30 +47,36 @@ _INSTANCE_JS = """
     var iid        = '__IID__';
     var initSmiles = '__SMILES__';
 
-    function onSmilesChange(smiles) {
+    function onSmilesChange(smiles, labComm) {
         // Always update the hidden input and visible label.
         var inp  = document.getElementById('jsme_smiles_' + iid);
         var disp = document.getElementById('jsme_display_' + iid);
         if (inp)  inp.value        = smiles;
         if (disp) disp.textContent = smiles;
 
-        // Escape for embedding inside a Python single-quoted string.
-        var safe = smiles.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-
+        // ── Colab ─────────────────────────────────────────────────────────────
         if (window.google !== undefined) {
-            // ── Colab ─────────────────────────────────────────────────────────
             google.colab.kernel.invokeFunction('jsme_cb___IID__', [smiles], {});
-        } else {
-            // ── Classic Jupyter Notebook ───────────────────────────────────────
-            try {
-                var nb = (window.Jupyter && Jupyter.notebook)
-                      || (window.IPython && IPython.notebook);
-                if (nb && nb.kernel) {
-                    nb.kernel.execute(
-                        'import jsme_colab as _j; _j._set("' + iid + '", \'' + safe + '\')'
-                    );
-                }
-            } catch(e) {}
+            return;
+        }
+
+        // ── Classic Jupyter Notebook ───────────────────────────────────────────
+        // window.Jupyter is set by classic Jupyter Notebook; not by JupyterLab.
+        var nb = (window.Jupyter  && Jupyter.notebook)
+              || (window.IPython  && IPython.notebook);
+        if (nb && nb.kernel) {
+            var safe = smiles.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            nb.kernel.execute(
+                'import jsme_colab as _j; _j._set("' + iid + '", \'' + safe + '\')'
+            );
+            return;
+        }
+
+        // ── JupyterLab ────────────────────────────────────────────────────────
+        // window.jupyterapp is the JupyterLab application instance (v3+).
+        // We opened a kernel comm in initEditor(); just send on it here.
+        if (labComm) {
+            try { labComm.send({smiles: smiles}); } catch(e) {}
         }
     }
 
@@ -83,8 +89,24 @@ _INSTANCE_JS = """
         if (initSmiles) applet.readGenericMolecularInput(initSmiles);
         window._jsme_instances[iid] = applet;
 
+        // JupyterLab: open a kernel comm once so we can reuse it on every edit.
+        var labComm = null;
+        if (!window.google && !window.Jupyter && !(window.IPython && IPython.notebook)) {
+            try {
+                var panel  = window.jupyterapp && window.jupyterapp.shell.currentWidget;
+                var kernel = panel
+                          && panel.sessionContext
+                          && panel.sessionContext.session
+                          && panel.sessionContext.session.kernel;
+                if (kernel) {
+                    labComm = kernel.createComm('jsme___IID__');
+                    labComm.open({});
+                }
+            } catch(e) {}
+        }
+
         applet.setCallBack('AfterStructureModified', function() {
-            onSmilesChange(applet.smiles());
+            onSmilesChange(applet.smiles(), labComm);
         });
     }
 
@@ -143,6 +165,23 @@ class JSMEEditor:
             )
         except ImportError:
             pass
+
+        # JupyterLab: register a comm target so the JS kernel.createComm() call
+        # can deliver SMILES updates via the standard Jupyter comm protocol.
+        try:
+            ip = get_ipython()
+            if ip and getattr(ip, 'kernel', None) is not None:
+                ip.kernel.comm_manager.register_target(
+                    f'jsme_{self._id}', self._handle_comm
+                )
+        except Exception:
+            pass
+
+    def _handle_comm(self, comm, open_msg):
+        """Receive SMILES pushed from JupyterLab via kernel comm."""
+        @comm.on_msg
+        def _(msg):
+            self._smiles = msg['content']['data'].get('smiles', self._smiles)
 
     # ------------------------------------------------------------------
     # Display
