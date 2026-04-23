@@ -76,6 +76,13 @@ _INSTANCE_JS = """
         function handleChange() {
             var smiles = applet.smiles();
             onSmilesChange(smiles);
+            /* Colab (hosted + local runtime with google-colab installed). */
+            if (window.google !== undefined) {
+                try {
+                    google.colab.kernel.invokeFunction('jsme_cb___IID__', [smiles], {});
+                } catch(e) {}
+            }
+            /* Classic Jupyter / JupyterLab via kernel comm. */
             if (comm) {
                 try { comm.send({smiles: smiles}); } catch(e) {}
             }
@@ -137,6 +144,16 @@ class JSMEEditor:
             smiles = _mol_to_smiles(mol)
         self._initial_smiles = smiles or ""
         self._smiles = self._initial_smiles
+
+        # Colab: register invokeFunction callback (works with google-colab installed).
+        try:
+            from google.colab import output
+            output.register_callback(
+                f'jsme_cb_{self._id}',
+                lambda s: setattr(self, '_smiles', s),
+            )
+        except ImportError:
+            pass
 
         # Register an ipykernel comm target (classic Jupyter / JupyterLab).
         try:
