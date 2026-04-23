@@ -29,40 +29,36 @@ _LOAD_JS = """
 # __IID__, __SMILES__, __WIDTH__, __HEIGHT__, __OPTIONS__, __MODEL_ID__
 # are replaced before injection.
 _INSTANCE_JS = """
+<input type="hidden" id="jsme_smiles___IID__" value="__SMILES__">
 <div id="jsme_container___IID__"></div>
 <script>
 (function() {
-    var iid      = '__IID__';
-    var modelId  = '__MODEL_ID__';
+    var iid       = '__IID__';
+    var modelId   = '__MODEL_ID__';
     var initSmiles = '__SMILES__';
 
     function syncToWidget(smiles) {
-        // ── Classic Jupyter Notebook ──────────────────────────────────────────
+        // Always update the hidden input — eval_js reads this in Colab.
+        var inp = document.getElementById('jsme_smiles_' + iid);
+        if (inp) inp.value = smiles;
+
+        // ── Classic Jupyter: proper ipywidgets comm protocol ──────────────
         try {
-            if (window.IPython && IPython.notebook && IPython.notebook.kernel) {
-                var safe = smiles.replace(/\\\\/g,'\\\\\\\\').replace(/"/g,'\\\\"');
-                IPython.notebook.kernel.execute(
-                    'import ipywidgets as __iw;' +
-                    '__w=__iw.Widget.widgets.get("'+modelId+'");' +
-                    '__w and setattr(__w,"value","'+safe+'")'
-                );
+            var comm = IPython.notebook.kernel.comm_manager.comms[modelId];
+            if (comm) {
+                comm.send({method: 'update', state: {value: smiles}, buffer_paths: []});
                 return;
             }
         } catch(e) {}
 
-        // ── JupyterLab / VS Code (requirejs + @jupyter-widgets/base) ──────────
+        // ── JupyterLab / VS Code: requirejs ──────────────────────────────
         try {
             require(['@jupyter-widgets/base'], function(base) {
-                var mgrs = base.ManagerBase._managers;
-                var mgr  = mgrs && mgrs[0];
-                if (!mgr && window.IPython && IPython.WidgetManager) {
-                    mgr = IPython.WidgetManager._managers &&
-                          IPython.WidgetManager._managers[0];
-                }
+                var mgr = base.ManagerBase._managers && base.ManagerBase._managers[0];
                 if (mgr) {
-                    mgr.get_model(modelId).then(function(model) {
-                        model.set('value', smiles);
-                        model.save_changes();
+                    mgr.get_model(modelId).then(function(m) {
+                        m.set('value', smiles);
+                        m.save_changes();
                     });
                 }
             });
@@ -86,13 +82,8 @@ _INSTANCE_JS = """
     if (window._jsme_ready) {
         initEditor();
     } else {
-        if (!window._jsme_colab_loaded) {
-            // Loader not yet injected (can happen if cells run out of order)
-            window._jsme_queue = window._jsme_queue || [];
-            window._jsme_queue.push(initEditor);
-        } else {
-            window._jsme_queue.push(initEditor);
-        }
+        window._jsme_queue = window._jsme_queue || [];
+        window._jsme_queue.push(initEditor);
     }
 })();
 </script>
@@ -194,20 +185,17 @@ class JSMEEditor:
           callback.  Call this from a *separate cell* after editing so the
           kernel has had time to process the async update.
         """
-        # Colab path: synchronous pull directly from the live JS applet.
+        # Colab: read the hidden input that JS keeps current on every edit.
         try:
             from google.colab.output import eval_js
             result = eval_js(
-                "(function(){"
-                f"  var a=window._jsme_instances && window._jsme_instances['{self._id}'];"
-                "   return a ? a.smiles() : '';"
-                "})()"
+                f"(document.getElementById('jsme_smiles_{self._id}') || {{}}).value || ''"
             )
             return result or ""
-        except (ImportError, Exception):
+        except ImportError:
             pass
 
-        # Standard Jupyter path: widget value kept current by JS push.
+        # Jupyter: widget value is pushed by JS via the ipywidgets comm.
         return self._widget.value
 
     def set_smiles(self, smiles: str):
